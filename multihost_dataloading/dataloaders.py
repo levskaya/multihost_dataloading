@@ -54,7 +54,7 @@ def construct_test_mesh_32() -> np.ndarray:
   general case: where a given host may have multiple independent model replicas
   on it (each loading different data), and where these replicas may stretch
   across host boundaries.
- 
+
   This may occur! E.g. PaLM used 12 way model parallelism in a given replica.
   Which is not evenly divisble by the number of devices on many TPU platforms.
 
@@ -275,32 +275,24 @@ def get_per_replica_data_pipeline(
   def identify_shards(device_to_index) -> Dict[Device, ShardInfo]:
     # Now, the following gets the unique set of slices into the
     # GDA (i.e one per replica) and which devices map to those.
-    index_hash_to_shard_idx = {}  # int, int
-    device_to_shard_info = {}  # device, int,
+    index_hash_to_shard_idx : Dict[int, int] = {}
+    device_to_shard_info : Dict[Device, int] = {}
     for (device, index_tuple) in device_to_index.items():
       index_hash = gda_lib._hashed_index(index_tuple)  # pylint: disable=protected-access
-
-      if index_hash not in index_hash_to_shard_idx:
-        index_hash_to_shard_idx[index_hash] = len(index_hash_to_shard_idx)
-
+      shard_idx = index_hash_to_shard_idx.setdefault(index_hash, len(index_hash_to_shard_idx))
       indices_size = index_tuple[data_dim].stop - index_tuple[data_dim].start
-      device_to_shard_info[device] = ShardInfo(
-          index_hash_to_shard_idx[index_hash], indices_size)
+      device_to_shard_info[device] = ShardInfo(shard_idx, indices_size)
 
     num_shards = len(index_hash_to_shard_idx)
-
     for device in jax.local_devices():
       shard_info = device_to_shard_info[device]
-
-      sharded_dataset = iter(
-          dataset.shard(num_shards=num_shards, index=shard_info.idx).batch(
-              shard_info.size).repeat().as_numpy_iterator())  # for Jax
-
-      # we only want one copy of each pipeline per host. To change this to
-      # per-device, simply use a list instead of dict here - removing the
-      # if in line, and making indexing in one line les s laters.
       if shard_info.idx not in shard_idx_to_dataset:
-        shard_idx_to_dataset[shard_info.idx] = sharded_dataset
+        shard_idx_to_dataset[shard_info.idx] = iter(
+            dataset.shard(num_shards=num_shards, index=shard_info.idx)
+                  .batch(shard_info.size)
+                  .repeat()
+                  .as_numpy_iterator())
+
     return wrap_dict_as_pytree_leaf(device_to_shard_info)
 
   # create one of these for each dataset element
@@ -319,8 +311,6 @@ def get_per_replica_data_pipeline(
   return next_fn
 
 
-# @levskaya, @skyewanderman this is a bit of a hack. 
-# I'm going to try and do it neater.
 def transpose_and_wrap_per_shard(
     shard_idx_to_loaded_data: Dict[int, Pytree]) -> Pytree:
   """Creates necessary datastructure to provide dicts of shards to tree_map.
@@ -330,18 +320,11 @@ def transpose_and_wrap_per_shard(
     the following, with a nested multilevel dict/tuple.
     {shard_idx1: {'inputs': (Array, Array) 'labels': Array}, shard_idx2: ...}
     we want instead
-    {'inputs': {Container, Container), 'labels': Container}
+    {'inputs': (Container, Container), 'labels': Container}
     where container is a dict containing all the shards for that object to be
     formed into a GDA, but a standard dict would be enumerated by tree_map
-    rather than passed whole.
-    We create a custom leaf for the pytree that holds the necessary
-    information for that whole GDA to be formed per object in the tf.data
-    ouptut.
-    We only need this function for the per replica option, as only here do
-    we have mutiple pipelines on the one host. Everywhere else only a single
-    data pipeline is called and the output is therefore in the correct
-    pytree structure. With them, the complexity lies in deriving the initial
-    pipeline.
+    rather than passed whole, so use a custom unregistered "leaf-like" dict
+    type instead.
 
     Args:
       shard_index_to_loaded_data: A dict mapping shard indices to that shard of
@@ -351,33 +334,18 @@ def transpose_and_wrap_per_shard(
       A pytree matching an individual tf.data call, but holding a custom dict
       as each leaf so that a GDA can be formed from sharded pieces.
   """
-  first_dict_key = next(iter(shard_idx_to_loaded_data))
-  sample_dataset = shard_idx_to_loaded_data[first_dict_key]
-  desired_structure = jax.tree_util.tree_structure(sample_dataset)
-  num_shard_indices = len(shard_idx_to_loaded_data)
-  # the first n elements may not correspond to the
-  # 0-th shard, as only shards 3,5 may be on on this host
-  shard_indices = [k for k, _ in shard_idx_to_loaded_data.items()]
-  # As a result, we flatten the pytree,
-  leaves, _ = jax.tree_util.tree_flatten(shard_idx_to_loaded_data)
-  num_containers = len(leaves) // num_shard_indices
-  # We want to handle arbitrary tf.data pytrees and because tree_map
-  # enumerates all leaves, we need to construct a custom class to hold the per
-  # shard data for that leaf of the tf.data result. Custom classes are treated
-  # as a single leaf, so we can pass the entire class to tree map.
-  containers = [wrap_dict_as_pytree_leaf(dict()) for _ in range(num_containers)]
-  for container_idx in range(0, num_containers):
-    # containers are formed from every num_total_leaves % num_containers
-    # where num_containers is the total number of leaf GDAs formed.
-    # This assumes that each element produced by tf.data has the same
-    # number along any partitioned dimensions, and that the partitioned
-    # dimensions are the same.
-    values = leaves[container_idx::num_containers]
-    for value_idx, value in enumerate(values):
-      shard_index = shard_indices[value_idx]
-      containers[container_idx][shard_index] = value
-  # And reform a pytree with the containers as leaf nodes
-  return jax.tree_util.tree_unflatten(desired_structure, containers)
+  outer_structure = jax.tree_util.tree_structure(
+      {k: 0 for k in shard_idx_to_loaded_data})
+  inner_structure = jax.tree_util.tree_structure(
+      next(iter(shard_idx_to_loaded_data.values())))
+  transposed_tree = jax.tree_util.tree_transpose(
+      outer_structure,
+      inner_structure,
+      shard_idx_to_loaded_data)
+  return inner_structure.unflatten(
+      map(wrap_dict_as_pytree_leaf,
+          inner_structure.flatten_up_to(transposed_tree)))
+
 
 
 def get_next_per_replica(device_to_shard_info: Pytree,
@@ -420,14 +388,6 @@ def get_next_per_replica(device_to_shard_info: Pytree,
 
 _hashed_set_of_indexes = lambda indexes: hash(  # pylint: disable=g-long-lambda
     np.array([(v.start, v.stop) for idx in indexes for v in idx]).tobytes())  # pylint: disable=g-complex-comprehension
-
-
-def get_total_length_of_unique_indexes(
-    unique_indexes: List[Tuple[slice, slice]]) -> int:
-  size = 0
-  for (data, _) in unique_indexes:
-    size += data.stop - data.start
-  return size
 
 
 def deduplicate_indexes(
@@ -535,7 +495,7 @@ def get_per_host_data_pipeline(dataset: tf.data.Dataset,
 
   check_inputs(dataset, global_data_shape, data_axes)
 
-  
+
   def _get_shard_indices(shape, axes):
     shape = tuple(shape)  # now we are inside a tree map, convert back
     return wrap_dict_as_pytree_leaf(
@@ -607,7 +567,7 @@ def get_next_per_host(sharded_dataset: tf.data.Dataset,
     shape = tuple(shape)
     return GlobalDeviceArray(shape, global_mesh, axes,
                             device_buffers)
-  
+
   pytree_of_gdas = jax.tree_map(form_gda, local_data, global_data_shape,
                               data_axes)
 
@@ -656,11 +616,11 @@ def get_fully_sharded_data_pipeline(
 
 def reshard_fn(input_constraints,
                input_gda: GlobalDeviceArray) -> GlobalDeviceArray:
-  '''Infer sharding from shape. 
-  
-    We need to do this because we need some way of looking up 
+  '''Infer sharding from shape.
+
+    We need to do this because we need some way of looking up
     sharding for arbitrary pytrees inside pjit. Pax uses the
-    rank - this ought to be better, but it isn't perfect! 
+    rank - this ought to be better, but it isn't perfect!
     There must be a better way.
     '''
   # TODO(sholto): pax has initial reshapes to prevent unnecessary
